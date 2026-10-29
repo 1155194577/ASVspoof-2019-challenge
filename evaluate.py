@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import warnings
 from pathlib import Path
 from typing import Dict, Optional, Sequence
 
@@ -68,8 +69,16 @@ def load_checkpoint(path: Path) -> Dict:
             "train first with `python train.py`, or pass --checkpoint"
         )
     try:
-        return torch.load(path, map_location="cpu")  # weights_only=True by default
-    except Exception:  # older torch / older checkpoints
+        # our checkpoints hold tensors + plain values only, so the safe path works
+        return torch.load(path, map_location="cpu", weights_only=True)
+    except TypeError:  # torch < 1.13 has no weights_only kwarg
+        return torch.load(path, map_location="cpu")
+    except Exception:  # older checkpoints pickling numpy objects
+        warnings.warn(
+            "checkpoint needs the legacy unpickler (weights_only=False)",
+            RuntimeWarning,
+            stacklevel=2,
+        )
         return torch.load(path, map_location="cpu", weights_only=False)
 
 

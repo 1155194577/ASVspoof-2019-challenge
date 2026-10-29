@@ -1,0 +1,50 @@
+# ---------------------------------------------------------------------------
+# Generated / large artefacts -- never commit these
+# ---------------------------------------------------------------------------
+
+# Pre-extracted feature vectors written by prepare_features.py
+# (train.npz, validation.npz, test.npz + manifest.json). Regenerate with
+#   python prepare_features.py
+features/
+
+# Featurised split cache used by dataPreprocessor --cache-dir
+cache/
+
+# Trained models (remove this line if you want to version small checkpoints)
+checkpoints/
+
+# Per-utterance score CSVs from evaluate.py --out
+scores*.csv
+
+# Figures written by plot.py
+figures/
+
+# Cluster credentials -- the local deploy key for submit.sh must never be
+# committed (it is a private key, not a public one)
+.ssh/
+
+# Slurm / cluster output
+logs/
+slurm-*.out
+
+# Portable interpreter some clusters need (python-build-standalone)
+py/
+
+
+# ---------------------------------------------------------------------------
+# Python
+# ---------------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.ruff_cache/
+.pytest_cache/
+.ipynb_checkpoints/
+
+# ---------------------------------------------------------------------------
+# OS / editor
+# ---------------------------------------------------------------------------
+.DS_Store
+*.swp

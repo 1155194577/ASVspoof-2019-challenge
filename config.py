@@ -35,10 +35,10 @@ class TrainingConfig:
     model: str = "svm"
 
     # ---- optimisation ------------------------------------------------------
-    epochs: int = 3
+    epochs: int = 50
     # Hinge-loss SGD needs a step size ~10x larger than cross-entropy's
     # 1e-3 default to move the margin in 3 epochs.
-    lr: float = 0.05
+    lr: float = 0.001
     batch_size: int = 64
     momentum: float = 0.9
     weight_decay: float = 1e-4       # plays the role of 1/C in an SVM
@@ -46,7 +46,7 @@ class TrainingConfig:
     class_weight: str = "balanced"   # bonafide is the minority class
 
     # ---- front-end ---------------------------------------------------------
-    feature: str = "mfcc"            # "mfcc" | "lfcc" | "logmel"
+    feature: str = "lfcc"            # "mfcc" | "lfcc" | "logmel"
     pooling: str = "mean_std"        # utterance-level vector for SVM-style models
     n_mfcc: int = 20
     n_lfcc: int = 20

@@ -28,6 +28,7 @@ Notes
 from __future__ import annotations
 
 import argparse
+import json
 import time
 from pathlib import Path
 from typing import Dict, Optional, Sequence, Tuple
@@ -117,6 +118,21 @@ def make_loader(
         generator=generator,
         drop_last=False,
     )
+
+
+def write_history(path: Path, args: argparse.Namespace, history: list) -> None:
+    """Persist per-epoch metrics so plot.py can draw the learning curves."""
+    def clean(value):
+        if isinstance(value, float) and not np.isfinite(value):
+            return None  # NaN has no JSON representation
+        return value
+
+    payload = {
+        "args": vars(args),
+        "history": [{k: clean(v) for k, v in row.items()} for row in history],
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2))
 
 
 def class_weights_from_labels(y: np.ndarray, mode: str) -> Optional[torch.Tensor]:
@@ -344,6 +360,7 @@ def main(argv: Optional[Sequence[str]] = None) -> Dict[str, float]:
     ckpt_dir = Path(args.checkpoint_dir)
     ckpt_dir.mkdir(parents=True, exist_ok=True)
     ckpt_name = f"{args.model}-{args.feature}-{args.pooling}.pt"
+    history_path = ckpt_dir / f"history-{args.model}-{args.feature}-{args.pooling}.json"
     ckpt_path = ckpt_dir / ckpt_name
 
     best_eer = float("nan")  # stays NaN if a split has only one class
@@ -393,6 +410,7 @@ def main(argv: Optional[Sequence[str]] = None) -> Dict[str, float]:
                 **{f"val_{k}": v for k, v in eval_metrics.items()},
             }
         )
+        write_history(history_path, args, history)
 
         if np.isnan(eer):
             if best_epoch == 0:  # degenerate split: at least keep epoch 1
@@ -407,6 +425,7 @@ def main(argv: Optional[Sequence[str]] = None) -> Dict[str, float]:
     print(f"\nbest checkpoint: {ckpt_path} (epoch {max(best_epoch, 1)}, EER {best_eer_text})")
     print(f"final val EER  : {final_eer_text}")
     print(f"labels         : 0={LABEL_NAMES[0]}, 1={LABEL_NAMES[1]}")
+    print(f"history        : {history_path}  (plot.py reads this)")
 
     return {
         "best_eer": best_eer,
