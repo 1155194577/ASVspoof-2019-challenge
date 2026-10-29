@@ -43,6 +43,7 @@ from __future__ import annotations
 import hashlib
 import json
 import shutil
+import warnings
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional, Tuple, Union
@@ -55,6 +56,8 @@ try:  # pragma: no cover - import guard only
         Audio,
         ClassLabel,
         Features,
+        IterableDataset,
+        Sequence,
         Value,
         load_dataset,
         load_from_disk,
@@ -75,6 +78,7 @@ __all__ = [
     "ASVspoofPreprocessor",
     "NumpyFeatureDataset",
     "TorchFeatureDataset",
+    "pool_feature_map",
     "mel_filterbank",
     "power_to_db",
     "dct_matrix",
@@ -83,6 +87,7 @@ __all__ = [
 LABEL_NAMES: Tuple[str, str] = ("bonafide", "spoof")
 FEATURES = ("logmel", "mfcc", "lfcc")
 NORMALIZATIONS = ("none", "per_utterance", "global")
+POOLINGS = ("mean", "std", "mean_std", "min_max", "flat")
 
 
 # --------------------------------------------------------------------------- #
@@ -171,6 +176,42 @@ def _stft_power(
     frames = np.lib.stride_tricks.sliding_window_view(waveform, n_fft)[::hop_length]
     spectrum = np.fft.rfft(frames * window, axis=-1)
     return (spectrum.real**2 + spectrum.imag**2).astype(np.float32)
+
+
+def pool_feature_map(
+    feature: np.ndarray, pooling: str = "mean_std"
+) -> np.ndarray:
+    """Collapse the time axis of a feature map into one fixed-length vector.
+
+    Classical models (SVM, GMM, logistic regression) need a single vector per
+    utterance, while :meth:`ASVspoofPreprocessor.prepare` keeps a ``(C, T)``
+    map. This applies the usual "MFCC statistics" pooling:
+
+    ==========  ===========  ==================================================
+    pooling     output dims  definition
+    ==========  ===========  ==================================================
+    ``mean``    ``C``        mean of every coefficient over time
+    ``std``     ``C``        standard deviation over time
+    ``mean_std`` ``2C``      mean and std concatenated (the SVM default)
+    ``min_max`` ``2C``       min and max over time
+    ``flat``    ``C*T``      raw frame-level features, no pooling
+    ==========  ===========  ==================================================
+
+    Accepts a single ``(C, T)`` map or a batch ``(..., C, T)``; pooling is
+    always over the last axis.
+    """
+    if pooling not in POOLINGS:
+        raise ValueError(f"pooling must be one of {POOLINGS}, got {pooling!r}")
+    arr = np.asarray(feature, dtype=np.float32)
+    if pooling == "flat":
+        return arr.reshape(arr.shape[:-2] + (-1,))
+    if pooling == "mean":
+        return arr.mean(axis=-1)
+    if pooling == "std":
+        return arr.std(axis=-1)
+    if pooling == "mean_std":
+        return np.concatenate([arr.mean(axis=-1), arr.std(axis=-1)], axis=-1)
+    return np.concatenate([arr.min(axis=-1), arr.max(axis=-1)], axis=-1)  # min_max
 
 
 # --------------------------------------------------------------------------- #
@@ -364,7 +405,7 @@ class ASVspoofPreprocessor:
         if self.config.audio_column not in getattr(dataset, "column_names", []):
             return dataset
         try:
-            if self.config.streaming:
+            if isinstance(dataset, IterableDataset):
                 next(iter(dataset.take(1)))
             else:
                 dataset[0]
@@ -566,23 +607,37 @@ class ASVspoofPreprocessor:
         return int(key)
 
     # ------------------------------------------------------------- map step
-    def _extract_row(self, example: Dict[str, Any]) -> Dict[str, Any]:
+    def _extract_row(
+        self, example: Dict[str, Any], pooling: Optional[str] = None
+    ) -> Dict[str, Any]:
         waveform, sr = self._decode_audio(example.get(self.config.audio_column))
         feature = self.extract_features(waveform, sr)
-        return {
-            "features": feature.astype(self.config.dtype),
+        row: Dict[str, Any] = {
             "label": self._label_of(example),
             "speaker_id": example.get("speaker_id"),
             "system_id": example.get("system_id"),
             "audio_file_name": example.get("audio_file_name"),
         }
+        if pooling is None:
+            row["features"] = feature.astype(self.config.dtype)
+        else:
+            row["pooled"] = pool_feature_map(feature, pooling)
+        return row
 
-    def _output_features(self, raw) -> Features:
+    def _output_features(self, raw, pooling: Optional[str] = None) -> Features:
         has_labels = self.config.label_column in getattr(raw, "column_names", [])
         label_type = ClassLabel(names=list(LABEL_NAMES)) if has_labels else Value("int8")
+        if pooling is None:
+            signal = {
+                "features": Array2D(
+                    shape=self.config.feature_shape, dtype=self.config.dtype
+                )
+            }
+        else:
+            signal = {"pooled": Sequence(Value(self.config.dtype))}
         return Features(
             {
-                "features": Array2D(shape=self.config.feature_shape, dtype=self.config.dtype),
+                **signal,
                 "label": label_type,
                 "speaker_id": Value("string"),
                 "system_id": Value("string"),
@@ -597,6 +652,7 @@ class ASVspoofPreprocessor:
         limit: Optional[int] = None,
         filter_fn: Optional[Callable[[Dict[str, Any]], bool]] = None,
         force: bool = False,
+        pooling: Optional[str] = None,
     ):
         """Decode + featurise one split.
 
@@ -606,15 +662,24 @@ class ASVspoofPreprocessor:
         limit: keep only the first ``limit`` utterances (debugging).
         filter_fn: predicate on a raw example, e.g. ``lambda ex: ex["key"] == 1``.
         force: recompute even if this split is already cached in memory.
+        pooling: when given (see :func:`pool_feature_map`), store one fixed
+            length vector per utterance in a ``pooled`` column instead of the
+            ``(C, T)`` map. Far cheaper to keep on disk (~4 MB for the whole
+            training split with ``mean_std`` MFCC), which is what you want
+            before moving features to another machine.
 
         Returns
         -------
         ``datasets.Dataset`` (or ``IterableDataset`` when ``streaming=True``)
-        with columns ``features``, ``label``, ``speaker_id``, ``system_id``,
-        ``audio_file_name``.
+        with columns ``features`` (or ``pooled``), ``label``, ``speaker_id``,
+        ``system_id``, ``audio_file_name``.
         """
-        if split in self._prepared and not force:
-            return self._prepared[split]
+        if pooling is not None and pooling not in POOLINGS:
+            raise ValueError(f"pooling must be one of {POOLINGS}, got {pooling!r}")
+
+        cache_key = (split, pooling)
+        if cache_key in self._prepared and not force:
+            return self._prepared[cache_key]
 
         if limit is None:
             limit = self.config.limit
@@ -627,14 +692,14 @@ class ASVspoofPreprocessor:
             and not self.config.streaming
             and filter_fn is None
         )
-        cache_path = self._cache_path(split, limit) if use_disk_cache else None
+        cache_path = self._cache_path(split, limit, pooling) if use_disk_cache else None
         if (
             cache_path is not None
             and not force
             and (cache_path / "dataset_info.json").exists()
         ):
             prepared = load_from_disk(str(cache_path))
-            self._prepared[split] = prepared
+            self._prepared[cache_key] = prepared
             return prepared
 
         raw = self._load_raw(split)
@@ -658,8 +723,9 @@ class ASVspoofPreprocessor:
             }
         prepared = raw.map(
             self._extract_row,
-            features=self._output_features(raw),
+            features=self._output_features(raw, pooling),
             remove_columns=columns,
+            fn_kwargs={"pooling": pooling},
             **map_kwargs,
         )
 
@@ -669,13 +735,18 @@ class ASVspoofPreprocessor:
             cache_path.parent.mkdir(parents=True, exist_ok=True)
             prepared.save_to_disk(str(cache_path))
 
-        self._prepared[split] = prepared
+        self._prepared[cache_key] = prepared
         return prepared
 
-    def _cache_path(self, split: str, limit: Optional[int] = None) -> Path:
+    def _cache_path(
+        self, split: str, limit: Optional[int] = None, pooling: Optional[str] = None
+    ) -> Path:
         assert self.config.cache_dir is not None
         suffix = f"-n{limit}" if limit is not None else ""
-        return Path(self.config.cache_dir) / f"{split}-{self.config.fingerprint()}{suffix}"
+        pool = f"-{pooling}" if pooling is not None else ""
+        return Path(self.config.cache_dir) / (
+            f"{split}-{self.config.fingerprint()}{pool}{suffix}"
+        )
 
     # ------------------------------------------------------------- statistics
     def split_statistics(self, split: str) -> Dict[str, Any]:
@@ -826,6 +897,56 @@ class ASVspoofPreprocessor:
     def get_numpy_dataset(self, split: str = "train", with_metadata: bool = False):
         """Thin NumPy wrapper (no torch needed)."""
         return NumpyFeatureDataset(self.prepare(split), with_metadata=with_metadata)
+
+    def get_sklearn_dataset(
+        self,
+        split: str = "train",
+        pooling: str = "mean_std",
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """``(X[N, D], y[N])`` utterance vectors for classical ML baselines.
+
+        The time axis is collapsed with :func:`pool_feature_map`, so ``mfcc``
+        with ``pooling="mean_std"`` and ``n_mfcc=20`` gives 40 dimensions per
+        utterance -- exactly what ``StandardScaler`` + ``SVC`` expect.
+
+        Fit the scaler and the model on ``train`` only, then reuse them for
+        ``validation`` / ``test``.
+
+        .. warning::
+           With ``normalize="per_utterance"`` every coefficient is already
+           zero-mean and unit-variance *inside* each utterance, so mean/std
+           pooling yields almost the same vector for every file. For SVM-style
+           baselines use ``normalize="none"`` (recommended) or ``"global"``.
+        """
+        if self.config.normalize == "per_utterance" and pooling != "flat":
+            warnings.warn(
+                'normalize="per_utterance" + pooling="%s" pools features that '
+                "are already standardised per utterance, so the vectors will be "
+                'nearly constant. Use normalize="none" for SVM baselines.'
+                % pooling,
+                RuntimeWarning,
+                stacklevel=2,
+            )
+
+        # `prepare(..., pooling=...)` pools during extraction, so the split is
+        # stored as (N, D) vectors instead of (N, C, T) maps: the full training
+        # split stays at a few MB instead of ~800 MB.
+        dataset = self.prepare(split, pooling=pooling)
+
+        if self.config.streaming:
+            vectors, labels = [], []
+            for row in dataset:
+                vectors.append(np.asarray(row["pooled"], dtype=np.float32))
+                labels.append(int(row["label"]))
+            if not vectors:
+                return np.empty((0, 0), dtype=np.float32), np.empty(0, dtype=np.int64)
+            return np.stack(vectors).astype(np.float32), np.asarray(labels, dtype=np.int64)
+
+        features = np.asarray(dataset["pooled"], dtype=np.float32)
+        labels = np.asarray(dataset["label"], dtype=np.int64)
+        if features.size == 0:
+            return np.empty((0, 0), dtype=np.float32), labels
+        return features.reshape(len(labels), -1), labels
 
     def get_torch_dataset(self, split: str = "train", with_metadata: bool = False):
         """``torch.utils.data.Dataset`` yielding ``(float32 tensor[C,T], int64)``."""
