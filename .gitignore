@@ -13,6 +13,9 @@ cache/
 # Trained models (remove this line if you want to version small checkpoints)
 checkpoints/
 
+# Numbered experiment folders (weights + plots per run)
+experiment_log/
+
 # Per-utterance score CSVs from evaluate.py --out
 scores*.csv
 

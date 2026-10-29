@@ -31,6 +31,7 @@ class TrainingConfig:
     """Defaults shared by ``train.py`` and ``evaluate.py``."""
 
     # ---- model -------------------------------------------------------------
+    # "svm" (linear kernel) | "svm_rff" (RBF kernel, random Fourier features)
     # TODO: "hubert" / "wavlm" / "wav2vec2" backbones, see model.build_model
     model: str = "svm"
 
@@ -38,11 +39,15 @@ class TrainingConfig:
     epochs: int = 50
     # Hinge-loss SGD needs a step size ~10x larger than cross-entropy's
     # 1e-3 default to move the margin in 3 epochs.
-    lr: float = 0.001
+    lr: float = 0.01
     batch_size: int = 64
     momentum: float = 0.9
     weight_decay: float = 1e-4       # plays the role of 1/C in an SVM
     margin: float = 1.0
+    loss: str = "hinge"              # "hinge" | "ce" (cross-entropy)
+    optimizer: str = "sgd"           # "sgd" | "adam"
+    gamma: Optional[float] = None    # RBF bandwidth for svm_rff (None -> 1/dim)
+    n_features: int = 512            # random Fourier features for svm_rff
     class_weight: str = "balanced"   # bonafide is the minority class
 
     # ---- front-end ---------------------------------------------------------
@@ -55,6 +60,7 @@ class TrainingConfig:
     # ---- data --------------------------------------------------------------
     train_split: str = "train"
     eval_split: str = "validation"
+    eval_test: bool = True          # score test once after training, stored in test.json
     limit: Optional[int] = None      # keep only N utterances per split
     streaming: bool = False          # stream from the Hub instead of downloading
     cache_dir: str = "cache"         # where featurised splits are persisted
@@ -66,13 +72,14 @@ class TrainingConfig:
     # ---- runtime -----------------------------------------------------------
     device: str = "auto"             # "auto" | "cpu" | "mps" | "cuda"
     seed: int = 0
-    checkpoint_dir: str = "checkpoints"
+    experiment_root: str = "experiment_log"   # exp_NNN/ folders live here
 
     @property
     def checkpoint_name(self) -> str:
-        """File name used for the best checkpoint of this configuration."""
-        return f"{self.model}-{self.feature}-{self.pooling}.pt"
+        """Model file name inside an experiment folder."""
+        return "model.pt"
 
     @property
     def checkpoint_path(self) -> str:
-        return f"{self.checkpoint_dir}/{self.checkpoint_name}"
+        """Where the *latest* experiment keeps its weights."""
+        return f"{self.experiment_root}/latest/{self.checkpoint_name}"

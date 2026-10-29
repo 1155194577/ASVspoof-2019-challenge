@@ -942,11 +942,21 @@ class ASVspoofPreprocessor:
                 return np.empty((0, 0), dtype=np.float32), np.empty(0, dtype=np.int64)
             return np.stack(vectors).astype(np.float32), np.asarray(labels, dtype=np.int64)
 
-        features = np.asarray(dataset["pooled"], dtype=np.float32)
+        # Read the column through Arrow and flatten it: `dataset["pooled"]`
+        # boxes every value into a Python float, which is ~6x the memory of the
+        # data (the 71k x 8020 test split needs ~13 GB that way).
+        try:
+            column = dataset.data.column("pooled")
+            chunks = [np.asarray(chunk.values) for chunk in column.chunks]
+            flat = np.concatenate(chunks, axis=0)
+            features = flat.reshape(len(dataset), -1).astype(np.float32, copy=False)
+        except (AttributeError, ValueError):  # unexpected arrow layout
+            features = np.asarray(dataset["pooled"], dtype=np.float32)
+            features = features.reshape(len(dataset), -1)
         labels = np.asarray(dataset["label"], dtype=np.int64)
         if features.size == 0:
             return np.empty((0, 0), dtype=np.float32), labels
-        return features.reshape(len(labels), -1), labels
+        return features, labels
 
     def get_torch_dataset(self, split: str = "train", with_metadata: bool = False):
         """``torch.utils.data.Dataset`` yielding ``(float32 tensor[C,T], int64)``."""

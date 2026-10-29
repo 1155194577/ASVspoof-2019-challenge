@@ -1,4 +1,4 @@
-"""Visualise the SVM baseline: learning curves, scores, and decision boundary.
+"""Visualise an experiment: learning curves, score distributions, t-SNE.
 
     conda activate ml
     python plot.py                         # checkpoint + features from config.py
@@ -12,9 +12,10 @@ Four panels:
 * **EER** — validation EER per epoch (the metric the checkpoint is chosen on),
   with the best epoch marked
 * **scores** — distribution of the SVM's spoof score for bonafide vs spoof,
-  with the decision threshold and the EER
-* **decision boundary** — the 40-d features projected to their first two
-  principal components; the straight black line is the SVM hyperplane
+  with the decision threshold, the EER, and the experiment's test EER when
+  ``test.json`` exists
+* **embedding** — t-SNE of the feature vectors, coloured by true label with
+  misclassified utterances ringed in black
 
 Everything is read from the checkpoint (standardisation, model, front-end) and
 the pre-extracted ``.npz`` features, so no dataset or audio is needed.
@@ -37,6 +38,7 @@ if "--show" not in sys.argv:  # headless by default (cluster, CI, ssh)
     matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
+import experiments
 import features_io
 from config import TrainingConfig
 from evaluate import load_checkpoint, score_batches
@@ -54,23 +56,28 @@ COLORS = {BONAFIDE: "#4C72B0", SPOOF: "#C44E52"}
 # --------------------------------------------------------------------------- #
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Plot SVM scores, decision boundary and learning curves",
+        description="Plot scores, t-SNE and learning curves",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
+    parser.add_argument("--exp", default=None,
+                        help="experiment number or folder (default: the latest one)")
     parser.add_argument("--checkpoint", default=None,
-                        help=f"defaults to {CFG.checkpoint_path}")
+                        help="override the model file (default: <experiment>/model.pt)")
     parser.add_argument("--history", default=None,
-                        help="history-*.json written by train.py (auto-detected)")
+                        help="override the history file (default: <experiment>/history.json)")
     parser.add_argument("--features-dir", default=CFG.features_dir,
                         help="pre-extracted .npz folder")
     parser.add_argument("--split", default=CFG.eval_split,
                         choices=["train", "validation", "test"])
     parser.add_argument("--limit", type=int, default=CFG.limit,
                         help="use only the first N utterances")
-    parser.add_argument("--out", default="figures/svm-report.png")
+    parser.add_argument("--out", default=None,
+                        help="figure path (default: <experiment>/plot.png)")
     parser.add_argument("--dpi", type=int, default=150)
     parser.add_argument("--max-scatter", type=int, default=4000,
-                        help="points drawn in the PCA panel")
+                        help="points embedded / drawn in the 2-D panel")
+    parser.add_argument("--perplexity", type=float, default=30.0,
+                        help="t-SNE perplexity")
     parser.add_argument("--show", action="store_true", help="open an interactive window")
     return parser.parse_args(argv)
 
@@ -148,45 +155,41 @@ def plot_scores(ax, labels: np.ndarray, scores: np.ndarray, eer: float) -> None:
     ax.legend(frameon=False, fontsize=9)
 
 
-def pca_project(x: np.ndarray):
-    """Project ``(N, D)`` to its first two principal components."""
-    mu = x.mean(axis=0, keepdims=True)
-    centred = x - mu
-    _, singular, vt = np.linalg.svd(centred, full_matrices=False)
-    components = vt[:2]
-    projected = centred @ components.T
-    explained = (singular**2) / np.sum(singular**2)
-    return projected, components, mu, explained
+def tsne_project(x: np.ndarray, max_points: int, perplexity: float):
+    """2-D t-SNE embedding of a random subset (returns points + their indices)."""
+    from sklearn.manifold import TSNE
+
+    n = len(x)
+    keep = (np.random.default_rng(0).choice(n, max_points, replace=False)
+            if n > max_points else np.arange(n))
+    subset = np.asarray(x[keep], dtype=np.float32)
+    perp = float(min(perplexity, max(5.0, (len(subset) - 1) / 4.0)))
+    kwargs = dict(n_components=2, init="pca", learning_rate="auto",
+                  random_state=0, perplexity=perp)
+    try:
+        tsne = TSNE(max_iter=750, **kwargs)
+    except TypeError:  # sklearn < 1.5 spells it n_iter
+        tsne = TSNE(n_iter=750, **kwargs)
+    return tsne.fit_transform(subset), keep
 
 
-def plot_boundary(ax, model, x: np.ndarray, labels: np.ndarray, device, max_points: int) -> None:
-    projected, components, mu, explained = pca_project(x)
+def plot_tsne(ax, x: np.ndarray, labels: np.ndarray, predictions: np.ndarray,
+              max_points: int, perplexity: float) -> None:
+    embedded, keep = tsne_project(x, max_points, perplexity)
+    labels_sub = labels[keep]
+    wrong = labels_sub != predictions[keep]
 
-    # the hyperplane is affine, so evaluating it on the PCA plane is exact
-    z1, z2 = np.meshgrid(
-        np.linspace(projected[:, 0].min(), projected[:, 0].max(), 140),
-        np.linspace(projected[:, 1].min(), projected[:, 1].max(), 140),
-    )
-    grid = np.stack([z1.ravel(), z2.ravel()], axis=1) @ components + mu
-    with torch.no_grad():
-        decision = model(torch.from_numpy(grid.astype(np.float32)).to(device))
-        margin = (decision[:, SPOOF] - decision[:, BONAFIDE]).cpu().numpy().reshape(z1.shape)
-
-    ax.contourf(z1, z2, margin, levels=[-1e9, 0.0, 1e9],
-                colors=[COLORS[BONAFIDE], COLORS[SPOOF]], alpha=0.08)
-    ax.contour(z1, z2, margin, levels=[0.0], colors="k", linewidths=1.6)
-
-    if len(projected) > max_points:
-        keep = np.random.default_rng(0).choice(len(projected), max_points, replace=False)
-        projected, labels = projected[keep], labels[keep]
     for klass in (BONAFIDE, SPOOF):
-        mask = labels == klass
-        ax.scatter(projected[mask, 0], projected[mask, 1], s=7, alpha=0.45,
+        mask = labels_sub == klass
+        ax.scatter(embedded[mask, 0], embedded[mask, 1], s=7, alpha=0.45,
                    color=COLORS[klass], label=LABEL_NAMES[klass], linewidths=0)
-
-    ax.set_xlabel(f"PC1 ({explained[0]:.0%} var)")
-    ax.set_ylabel(f"PC2 ({explained[1]:.0%} var)")
-    ax.set_title("decision boundary (2-D PCA view of the 40-d features)")
+    if wrong.any():
+        ax.scatter(embedded[wrong, 0], embedded[wrong, 1], s=26, facecolors="none",
+                   edgecolors="k", linewidths=0.8,
+                   label=f"misclassified ({wrong.mean() * 100:.1f}%)")
+    ax.set_xlabel("t-SNE 1")
+    ax.set_ylabel("t-SNE 2")
+    ax.set_title(f"t-SNE of the {x.shape[1]}-d features")
     ax.legend(frameon=False, fontsize=9, markerscale=2.5)
     ax.grid(alpha=0.2)
 
@@ -196,7 +199,8 @@ def plot_boundary(ax, model, x: np.ndarray, labels: np.ndarray, device, max_poin
 # --------------------------------------------------------------------------- #
 def main(argv: Optional[Sequence[str]] = None) -> str:
     args = parse_args(argv)
-    ckpt_path = Path(args.checkpoint) if args.checkpoint else Path(CFG.checkpoint_path)
+    exp_dir = experiments.resolve(args.exp, CFG.experiment_root)
+    ckpt_path = Path(args.checkpoint) if args.checkpoint else exp_dir / experiments.MODEL_NAME
     ckpt = load_checkpoint(ckpt_path)
 
     saved = ckpt.get("args", {})
@@ -217,7 +221,8 @@ def main(argv: Optional[Sequence[str]] = None) -> str:
     x_scaled = (x - mean) / std
 
     device = select_device("cpu")  # tiny linear model; cpu keeps this deterministic
-    model = build_model(model_key, input_dim=int(ckpt["input_dim"])).to(device)
+    model = build_model(model_key, input_dim=int(ckpt["input_dim"]),
+                        **ckpt.get("model_kwargs", {})).to(device)
     model.load_state_dict(ckpt["model_state"])
     model.eval()
 
@@ -225,13 +230,18 @@ def main(argv: Optional[Sequence[str]] = None) -> str:
     labels = np.asarray(labels, dtype=np.int64)
     eer = compute_eer(labels, scores)
 
-    history = find_history(args.history, ckpt_path, ckpt)
+    history_path = Path(args.history) if args.history else exp_dir / experiments.HISTORY_NAME
+    history = (
+        json.loads(history_path.read_text())
+        if history_path.exists()
+        else find_history(args.history, ckpt_path, ckpt)
+    )
     rows = (history or {}).get("history") or []
 
     if rows:  # learning curves only when train.py left a history file
         fig, axes = plt.subplots(2, 2, figsize=(13.5, 9.0))
         ax_acc, ax_eer = axes[0, 0], axes[0, 1]
-        ax_score, ax_boundary = axes[1, 0], axes[1, 1]
+        ax_score, ax_embed = axes[1, 0], axes[1, 1]
         epochs = [row["epoch"] for row in rows]
         plot_curve(
             ax_acc, epochs,
@@ -253,13 +263,18 @@ def main(argv: Optional[Sequence[str]] = None) -> str:
                              xy=(epochs[best_i], best_v * 100), xytext=(6, 10),
                              textcoords="offset points", fontsize=8)
     else:
-        fig, (ax_score, ax_boundary) = plt.subplots(1, 2, figsize=(13.5, 5.2))
-        print("note: no history-*.json found; plotting scores and boundary only")
+        fig, (ax_score, ax_embed) = plt.subplots(1, 2, figsize=(13.5, 5.2))
+        print("note: no history-*.json found; plotting scores and t-SNE only")
 
+    predictions = (scores > 0).astype(np.int64)
     plot_scores(ax_score, labels, scores, eer)
-    plot_boundary(ax_boundary, model, x_scaled, labels, device, args.max_scatter)
+    plot_tsne(ax_embed, x_scaled, labels, predictions,
+              args.max_scatter, args.perplexity)
 
     eer_text = "n/a" if np.isnan(eer) else f"EER {eer * 100:.2f}%"
+    test_metrics = experiments.read_metrics(exp_dir, "test")
+    if test_metrics and test_metrics.get("eer") is not None:
+        eer_text += f"  ·  test EER {test_metrics['eer'] * 100:.2f}%"
     fig.suptitle(
         f"{type(model).__name__} · {feature} + {pooling} · {args.split}: "
         f"{len(labels)} utterances ({int((labels == BONAFIDE).sum())} bonafide / "
@@ -268,9 +283,10 @@ def main(argv: Optional[Sequence[str]] = None) -> str:
     )
     fig.tight_layout(rect=(0, 0, 1, 0.94 if rows else 0.90))
 
-    out = Path(args.out)
+    out = Path(args.out) if args.out else exp_dir / experiments.PLOT_NAME
     out.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out, dpi=args.dpi, bbox_inches="tight")
+    print(f"experiment : {exp_dir}")
     print(f"checkpoint : {ckpt_path}")
     print(f"features   : {features_dir}/{args.split}.npz")
     print(f"history    : {'found' if history else 'missing'}")

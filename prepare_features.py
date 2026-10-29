@@ -61,7 +61,45 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
                         help="stream from the Hub instead of downloading a split")
     parser.add_argument("--cache-dir", default=CFG.cache_dir,
                         help="where to persist pooled splits ('' disables)")
+    parser.add_argument("--store-dtype", default="float32",
+                        choices=["float32", "float16"],
+                        help="on-disk dtype for the vectors (float16 halves the size)")
+    parser.add_argument("--manifest-only", action="store_true",
+                        help="rebuild manifest.json from the .npz files already on disk")
     return parser.parse_args(argv)
+
+
+def rebuild_manifest(out_dir: Path, args: argparse.Namespace) -> dict:
+    """Recreate manifest.json from existing .npz files (e.g. after a killed run)."""
+    npz_files = sorted(out_dir.glob("*.npz"))
+    if not npz_files:
+        raise SystemExit(f"no .npz files under {out_dir}")
+    manifest = {
+        "dataset": ASVspoofPreprocessor().config.dataset_name,
+        "feature": args.feature,
+        "pooling": args.pooling,
+        "normalize": "none",
+        "dim": None,
+        "splits": {},
+        "created": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "rebuilt": True,
+    }
+    for path in npz_files:
+        features, labels = features_io.load_split(out_dir, path.stem)
+        counts = np.bincount(labels, minlength=2)
+        manifest["dim"] = int(features.shape[1])
+        manifest["splits"][path.stem] = {
+            "n": int(len(labels)),
+            "bonafide": int(counts[0]),
+            "spoof": int(counts[1]),
+            "dim": int(features.shape[1]),
+            "file": path.name,
+            "bytes": path.stat().st_size,
+        }
+        print(f"{path.stem:<11} {features.shape} ({counts[0]} / {counts[1]})")
+    manifest_path = features_io.write_manifest(out_dir, manifest)
+    print(f"manifest    : {manifest_path}")
+    return manifest
 
 
 def main(argv: Optional[Sequence[str]] = None) -> dict:
@@ -80,6 +118,9 @@ def main(argv: Optional[Sequence[str]] = None) -> dict:
         splits=tuple(args.splits),
     )
 
+    if args.manifest_only:
+        return rebuild_manifest(out_dir, args)
+
     print(f"front-end   : {args.feature} + {args.pooling} pooling")
     print(f"output      : {out_dir}")
     print(f"splits      : {', '.join(args.splits)}\n")
@@ -89,6 +130,7 @@ def main(argv: Optional[Sequence[str]] = None) -> dict:
         "feature": args.feature,
         "pooling": args.pooling,
         "normalize": "none",
+        "dtype": args.store_dtype,
         "n_mfcc": args.n_mfcc,
         "n_lfcc": args.n_lfcc,
         "n_mels": args.n_mels,
@@ -113,9 +155,14 @@ def main(argv: Optional[Sequence[str]] = None) -> dict:
             dataset = pre.prepare(split, pooling=args.pooling)
             names = dataset["audio_file_name"]
             systems = dataset["system_id"]
+            # release the Arrow copy (2.3 GB for the flat test split) before
+            # allocating the float16 array we are about to write
+            pre._prepared.pop((split, args.pooling), None)
+            del dataset
 
         path = features_io.save_split(
-            out_dir, split, features, labels, names=names, systems=systems
+            out_dir, split, features, labels, names=names, systems=systems,
+            dtype=args.store_dtype,
         )
         counts = np.bincount(labels, minlength=2)
         manifest["dim"] = int(features.shape[1])

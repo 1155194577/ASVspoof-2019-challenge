@@ -23,6 +23,9 @@ Notes
 * ``normalize="none"`` in the preprocessor is deliberate: per-utterance CMVN
   would make the pooled mean/std identical for every utterance.
 * Use EER, not accuracy: the corpus is heavily spoof-heavy.
+* Validation decides the checkpoint (``history.json``); test is scored **once**
+  with that frozen model and stored as ``test.json``. Scoring test every epoch
+  would leak it into model selection.
 """
 
 from __future__ import annotations
@@ -37,6 +40,7 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader, TensorDataset
 
+import experiments
 import features_io
 from config import TrainingConfig
 from model import MODEL_REGISTRY, build_model, hinge_loss
@@ -155,11 +159,16 @@ def train_one_epoch(
     device: torch.device,
     class_weights: Optional[torch.Tensor] = None,
     margin: float = 1.0,
+    loss_name: str = "hinge",
 ) -> Dict[str, float]:
     model.train()
     total_loss = 0.0
     correct = 0
     seen = 0
+    criterion = None
+    if loss_name == "ce":
+        weight = None if class_weights is None else class_weights.to(device)
+        criterion = torch.nn.CrossEntropyLoss(weight=weight)
 
     for xb, yb in loader:
         xb = xb.to(device, non_blocking=True)
@@ -167,8 +176,11 @@ def train_one_epoch(
 
         optimiser.zero_grad(set_to_none=True)
         logits = model(xb)
-        weight = None if class_weights is None else class_weights.to(device)[yb]
-        loss = hinge_loss(logits, yb, margin=margin, weight=weight)
+        if criterion is not None:
+            loss = criterion(logits, yb)
+        else:
+            weight = None if class_weights is None else class_weights.to(device)[yb]
+            loss = hinge_loss(logits, yb, margin=margin, weight=weight)
         loss.backward()
         optimiser.step()
 
@@ -190,6 +202,7 @@ def evaluate(
     loader: DataLoader,
     device: torch.device,
     margin: float = 1.0,
+    loss_name: str = "hinge",
 ) -> Dict[str, float]:
     model.eval()
     total_loss = 0.0
@@ -201,7 +214,10 @@ def evaluate(
         xb = xb.to(device, non_blocking=True)
         yb = yb.to(device, non_blocking=True)
         logits = model(xb)
-        loss = hinge_loss(logits, yb, margin=margin)
+        if loss_name == "ce":
+            loss = torch.nn.functional.cross_entropy(logits, yb)
+        else:
+            loss = hinge_loss(logits, yb, margin=margin)
 
         batch = yb.size(0)
         total_loss += float(loss) * batch
@@ -237,6 +253,10 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
                         help="model registry key from model.build_model")
     parser.add_argument("--feature", default=CFG.feature, choices=["mfcc", "lfcc", "logmel"],
                         help="front-end feature type")
+    parser.add_argument("--gamma", type=float, default=CFG.gamma,
+                        help="RBF bandwidth for --model svm_rff (default 1/input_dim)")
+    parser.add_argument("--n-features", type=int, default=CFG.n_features,
+                        help="random Fourier features for --model svm_rff")
     parser.add_argument("--pooling", default=CFG.pooling,
                         choices=["mean", "std", "mean_std", "min_max", "flat"],
                         help="how the time axis is collapsed into one vector")
@@ -270,6 +290,10 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
                         help="L2 penalty; acts like 1/C of an SVM")
     parser.add_argument("--margin", type=float, default=CFG.margin,
                         help="hinge margin")
+    parser.add_argument("--loss", default=CFG.loss, choices=["hinge", "ce"],
+                        help="training objective")
+    parser.add_argument("--optimizer", default=CFG.optimizer, choices=["sgd", "adam"],
+                        help="optimiser")
     parser.add_argument("--class-weight", default=CFG.class_weight,
                         choices=["balanced", "none"],
                         help="inverse-frequency weights for the loss")
@@ -282,8 +306,15 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--features-dir", default=CFG.features_dir,
                         help="pre-extracted .npz folder from prepare_features.py "
                              "(skips the dataset entirely)")
-    parser.add_argument("--checkpoint-dir", default=CFG.checkpoint_dir,
-                        help="where the best checkpoint is written")
+    parser.add_argument("--exp-dir", default=None,
+                        help="experiment folder (default: auto-numbered experiment_log/exp_NNN)")
+    parser.add_argument("--exp-root", default=CFG.experiment_root,
+                        help="root for auto-numbered experiments")
+    parser.add_argument("--tag", default=None,
+                        help="free-form label stored in config.json")
+    parser.add_argument("--eval-test", action=argparse.BooleanOptionalAction,
+                        default=CFG.eval_test,
+                        help="score the TEST split once after training (never during)")
     return parser.parse_args(argv)
 
 
@@ -292,10 +323,22 @@ def main(argv: Optional[Sequence[str]] = None) -> Dict[str, float]:
     set_seed(args.seed)
     device = select_device(args.device)
 
+    # every run gets experiment_log/exp_NNN/ with config + history + weights
+    if args.exp_dir:
+        exp_dir = Path(args.exp_dir)
+        exp_dir.mkdir(parents=True, exist_ok=True)
+    else:
+        exp_dir = experiments.create(args.exp_root, tag=args.tag, config=vars(args))
+    if not (exp_dir / experiments.CONFIG_NAME).exists():
+        experiments.write_config(exp_dir, vars(args), tag=args.tag)
+    print(f"experiment  : {exp_dir}")
+
     print(f"device      : {device}")
     print(f"front-end   : {args.feature} + {args.pooling} pooling, normalize='none'")
+    print(f"model       : {args.model}")
     print(f"optimiser   : SGD(lr={args.lr}, momentum={args.momentum}, "
-          f"weight_decay={args.weight_decay}) for {args.epochs} epochs")
+          f"weight_decay={args.weight_decay}) for {args.epochs} epochs, "
+          f"batch {args.batch_size}")
 
     print(f"\nloading {args.train_split!r} and {args.eval_split!r} features ...")
     if args.features_dir:
@@ -310,6 +353,8 @@ def main(argv: Optional[Sequence[str]] = None) -> Dict[str, float]:
             args.feature = manifest.get("feature", args.feature)
             args.pooling = manifest.get("pooling", args.pooling)
         print(f"source      : pre-extracted {args.features_dir}")
+        # the manifest may have corrected feature/pooling -- keep config.json honest
+        experiments.write_config(exp_dir, vars(args), tag=args.tag)
         train_x, train_y = features_io.load_split(args.features_dir, args.train_split)
         eval_x, eval_y = features_io.load_split(args.features_dir, args.eval_split)
     else:
@@ -346,22 +391,38 @@ def main(argv: Optional[Sequence[str]] = None) -> Dict[str, float]:
         eval_x, eval_y, args.batch_size, False, args.seed, args.num_workers
     )
 
-    model = build_model(args.model, input_dim=train_x.shape[1]).to(device)
-    optimiser = torch.optim.SGD(
-        model.parameters(),
-        lr=args.lr,
-        momentum=args.momentum,
-        weight_decay=args.weight_decay,
-    )
+    model_kwargs: Dict[str, Any] = {}
+    if args.model == "svm_rff":
+        model_kwargs["n_features"] = args.n_features
+        if args.gamma is not None:
+            model_kwargs["gamma"] = args.gamma
+    elif args.model == "cnn2d":
+        n_coeffs = {"lfcc": args.n_lfcc, "mfcc": args.n_mfcc, "logmel": args.n_mels}[args.feature]
+        if train_x.shape[1] % n_coeffs:
+            raise SystemExit(
+                f"--model cnn2d needs flat pooling: {train_x.shape[1]} dims is not "
+                f"divisible by {n_coeffs} coefficients"
+            )
+        model_kwargs["shape"] = (n_coeffs, train_x.shape[1] // n_coeffs)
+    model = build_model(args.model, input_dim=train_x.shape[1], **model_kwargs).to(device)
+    print(f"architecture: {model}")
+    if args.optimizer == "adam":
+        optimiser = torch.optim.Adam(
+            model.parameters(), lr=args.lr, weight_decay=args.weight_decay
+        )
+    else:
+        optimiser = torch.optim.SGD(
+            model.parameters(),
+            lr=args.lr,
+            momentum=args.momentum,
+            weight_decay=args.weight_decay,
+        )
     class_weights = class_weights_from_labels(train_y, args.class_weight)
     if class_weights is not None:
         print(f"class weight: {class_weights.tolist()} (bonafide, spoof)")
 
-    ckpt_dir = Path(args.checkpoint_dir)
-    ckpt_dir.mkdir(parents=True, exist_ok=True)
-    ckpt_name = f"{args.model}-{args.feature}-{args.pooling}.pt"
-    history_path = ckpt_dir / f"history-{args.model}-{args.feature}-{args.pooling}.json"
-    ckpt_path = ckpt_dir / ckpt_name
+    ckpt_path = exp_dir / experiments.MODEL_NAME
+    history_path = exp_dir / experiments.HISTORY_NAME
 
     best_eer = float("nan")  # stays NaN if a split has only one class
     best_epoch = 0
@@ -372,6 +433,7 @@ def main(argv: Optional[Sequence[str]] = None) -> Dict[str, float]:
             {
                 "model_state": model.state_dict(),
                 "model": args.model,                 # registry key, e.g. "svm"
+                "model_kwargs": model_kwargs,        # needed to rebuild svm_rff
                 "model_name": type(model).__name__,
                 "input_dim": int(train_x.shape[1]),
                 "num_classes": N_CLASSES,
@@ -390,9 +452,9 @@ def main(argv: Optional[Sequence[str]] = None) -> Dict[str, float]:
     for epoch in range(1, args.epochs + 1):
         start = time.time()
         train_metrics = train_one_epoch(
-            model, train_loader, optimiser, device, class_weights, args.margin
+            model, train_loader, optimiser, device, class_weights, args.margin, args.loss
         )
-        eval_metrics = evaluate(model, eval_loader, device, args.margin)
+        eval_metrics = evaluate(model, eval_loader, device, args.margin, args.loss)
         seconds = time.time() - start
 
         eer = eval_metrics["eer"]
@@ -419,17 +481,47 @@ def main(argv: Optional[Sequence[str]] = None) -> Dict[str, float]:
             best_eer, best_epoch = eer, epoch
             save_checkpoint(epoch, eer)
 
+    # ---- one-shot TEST evaluation (after the checkpoint is frozen) -------
+    test_metrics = None
+    if args.eval_test and args.features_dir:
+        test_features = Path(args.features_dir) / "test.npz"
+        if test_features.exists():
+            test_x, test_y = features_io.load_split(args.features_dir, "test")
+            test_x = ((test_x - mean) / np.maximum(std, 1e-6)).astype(np.float32)
+            test_loader = make_loader(test_x, test_y, args.batch_size * 4, False,
+                                      args.seed, args.num_workers)
+            best_state = torch.load(ckpt_path, map_location=device,
+                                    weights_only=True)["model_state"]
+            model.load_state_dict(best_state)
+            test_metrics = evaluate(model, test_loader, device, args.margin, args.loss)
+            experiments.write_metrics(exp_dir, "test", {
+                "split": "test", **test_metrics,
+                "checkpoint_epoch": best_epoch,
+                "checkpoint_eer": best_eer,
+                "n_bonafide": int((test_y == 0).sum()),
+                "n_spoof": int((test_y == 1).sum()),
+            })
+        else:
+            print(f"\ntest       : {test_features} not found -- skipped "
+                  "(run `python prepare_features.py --splits test`)")
+
     final_eer = history[-1]["val_eer"]
     best_eer_text = "n/a" if np.isnan(best_eer) else f"{best_eer * 100:.2f}%"
     final_eer_text = "n/a" if np.isnan(final_eer) else f"{final_eer * 100:.2f}%"
     print(f"\nbest checkpoint: {ckpt_path} (epoch {max(best_epoch, 1)}, EER {best_eer_text})")
     print(f"final val EER  : {final_eer_text}")
     print(f"labels         : 0={LABEL_NAMES[0]}, 1={LABEL_NAMES[1]}")
-    print(f"history        : {history_path}  (plot.py reads this)")
+    print(f"history        : {history_path}")
+    if test_metrics is not None:
+        print(f"test EER       : {test_metrics['eer'] * 100:.2f}% "
+              f"({test_metrics['n']} utterances, saved to {exp_dir}/test.json)")
+    print(f"experiment dir : {exp_dir}  (config.json, history.json, model.pt)")
 
     return {
+        "experiment": str(exp_dir),
         "best_eer": best_eer,
         "final_val_eer": final_eer,
+        "test_eer": None if test_metrics is None else test_metrics["eer"],
         "checkpoint": str(ckpt_path),
         "train_size": int(train_x.shape[0]),
         "dim": int(train_x.shape[1]),

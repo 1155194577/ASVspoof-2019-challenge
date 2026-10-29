@@ -41,12 +41,13 @@ def save_split(
     labels: np.ndarray,
     names: Optional[Sequence[str]] = None,
     systems: Optional[Sequence[str]] = None,
+    dtype: str = "float32",
 ) -> Path:
-    """Write one split to ``<directory>/<split>.npz``."""
+    """Write one split to ``<directory>/<split>.npz`` (float16 halves the size)."""
     path = split_path(directory, split)
     path.parent.mkdir(parents=True, exist_ok=True)
     arrays: Dict[str, np.ndarray] = {
-        "X": np.asarray(features, dtype=np.float32),
+        "X": np.asarray(features, dtype=np.dtype(dtype)),
         "y": np.asarray(labels, dtype=np.int64),
     }
     if names is not None:
@@ -76,6 +77,17 @@ def load_split(
             data["names"].astype(str) if "names" in data.files else np.empty(0, dtype=object)
         )
     return features, labels, names
+
+
+def load_column(directory: str | Path, split: str, column: str):
+    """Read a single stored column (e.g. ``systems``) or ``None`` if absent."""
+    path = split_path(directory, split)
+    if not path.exists():
+        return None
+    with np.load(path, allow_pickle=False) as data:
+        if column not in data.files:
+            return None
+        return data[column].astype(str)
 
 
 def write_manifest(directory: str | Path, payload: Dict[str, Any]) -> Path:
